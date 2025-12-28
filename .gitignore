@@ -1,0 +1,17 @@
+.env
+.env.local
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+vendor/
+bin/
+dist/
+tmp/
+.idea/
+.vscode/
+*.log
