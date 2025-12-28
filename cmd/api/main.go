@@ -1,7 +1,6 @@
 // FitStack Payments Microservice
 //
-// This is the main entry point for the payment processing service.
-// It wires up all dependencies and starts the HTTP server.
+// Main entry point - wires up all dependencies and starts the server.
 package main
 
 import (
@@ -12,10 +11,10 @@ import (
 	"syscall"
 
 	"github.com/fitstack/fitstack-payments/config"
-	"github.com/fitstack/fitstack-payments/internal/api"
-	"github.com/fitstack/fitstack-payments/internal/payment"
-	"github.com/fitstack/fitstack-payments/internal/platform/fitstack_core"
-	"github.com/fitstack/fitstack-payments/internal/platform/mercadopago"
+	"github.com/fitstack/fitstack-payments/internal/adapters/django"
+	"github.com/fitstack/fitstack-payments/internal/adapters/mercadopago"
+	"github.com/fitstack/fitstack-payments/internal/core/service"
+	"github.com/fitstack/fitstack-payments/internal/handlers"
 )
 
 func main() {
@@ -23,31 +22,29 @@ func main() {
 
 	// Load configuration
 	cfg := config.Load()
-	log.Printf("Configuration loaded: Port=%s, CoreURL=%s", cfg.Server.Port, cfg.Core.BaseURL)
+	log.Printf("Config: Port=%s, Django=%s", cfg.Server.Port, cfg.Django.BaseURL)
 
-	// Validate required configuration
-	if err := validateConfig(cfg); err != nil {
-		log.Fatalf("Configuration error: %v", err)
-	}
+	// Wire up dependencies (Clean Architecture)
+	// ============================================
 
-	// Wire up dependencies (manual dependency injection)
-	//
-	// Infrastructure Layer
-	coreClient := fitstackcore.NewClient(cfg.Core.BaseURL, cfg.Core.APIKey)
+	// Adapters (Infrastructure Layer)
 	mpAdapter := mercadopago.NewAdapter()
+	mpValidator := mercadopago.NewWebhookValidator()
+	djangoClient := django.NewClient(cfg.Django.BaseURL, cfg.Django.APIKey)
 
 	// Service Layer
-	paymentService := payment.NewService(
-		coreClient, // implements domain.GymRepository
-		mpAdapter,  // implements domain.PaymentGateway
-		coreClient, // implements domain.CoreNotifier
+	paymentService := service.NewPaymentService(
+		mpAdapter,      // PaymentGateway
+		djangoClient,   // GymCredentialProvider
+		djangoClient,   // DjangoNotifier
+		mpValidator,    // WebhookValidator
 	)
 
-	// API Layer
-	handler := api.NewHandler(paymentService)
-	router := api.SetupRouter(handler, cfg.Server.GinMode)
+	// Handlers (Interface Layer)
+	paymentHandler := handlers.NewPaymentHandler(paymentService)
+	router := handlers.SetupRouter(paymentHandler, cfg.Server.GinMode)
 
-	// Start server in a goroutine
+	// Start server
 	serverAddr := fmt.Sprintf(":%s", cfg.Server.Port)
 	go func() {
 		log.Printf("Server listening on %s", serverAddr)
@@ -61,19 +58,5 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("Shutting down server...")
-}
-
-// validateConfig checks that required configuration values are set.
-func validateConfig(cfg *config.Config) error {
-	if cfg.Core.BaseURL == "" {
-		return fmt.Errorf("FITSTACK_CORE_URL is required")
-	}
-	if cfg.Core.APIKey == "" {
-		log.Println("Warning: FITSTACK_CORE_API_KEY not set")
-	}
-	if cfg.Security.EncryptionKey == "" {
-		log.Println("Warning: ENCRYPTION_KEY not set")
-	}
-	return nil
+	log.Println("Shutting down...")
 }

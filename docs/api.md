@@ -1,195 +1,242 @@
 # FitStack Payments API Documentation
 
-## Base URL
+## Overview
 
-- **Development**: `http://localhost:8080`
-- **Production**: `https://api.fitstackapp.com/payments`
+`fitstack-payments` is a Go microservice that handles payment processing for FitStack SaaS using Mercado Pago Checkout Pro.
+
+**Technology Stack**: Go 1.22+, Gin Gonic, Mercado Pago SDK
+
+---
+
+## Security Model
+
+### Server-to-Server Communication
+
+The checkout endpoint is designed for **server-to-server** communication between Django and this microservice.
+
+- **Authentication**: `Authorization: Bearer <SERVICE_API_KEY>`
+- **Stateless Checkout**: The `mp_access_token` is passed in the request body (Django sends the decrypted token)
+- **HTTPS Required**: All production traffic must use HTTPS
+
+### Webhook Security
+
+Mercado Pago webhooks are validated using:
+
+- **URL-based identification**: `/webhooks/:gym_slug` identifies which gym's secret to use
+- **Signature validation**: `x-signature` header is validated using HMAC-SHA256
+
+---
+
+## Base URLs
+
+| Environment | URL |
+|-------------|-----|
+| Development | `http://localhost:8080` |
+| Production | `https://payments.fitstackapp.com` |
 
 ---
 
 ## Endpoints
 
-### Create Checkout
+### `POST /api/v1/payments/checkout`
 
-Creates a Mercado Pago payment preference and returns the checkout URL.
+Creates a Mercado Pago payment preference.
 
-```
-POST /api/v1/payments/checkout
-```
+**Authentication**: Required (`Authorization: Bearer <token>`)
 
 **Headers:**
-| Header | Value | Required |
-|--------|-------|----------|
-| `Content-Type` | `application/json` | Yes |
-| `Authorization` | `Bearer <jwt_token>` | Yes |
+```
+Content-Type: application/json
+Authorization: Bearer <SERVICE_API_KEY>
+```
 
 **Request Body:**
 ```json
 {
-  "gym_id": "string",       // Gym slug identifier (required)
-  "amount": 5000.00,        // Amount in ARS (required, > 0)
-  "title": "string",        // Payment title (required)
-  "payer_email": "string"   // Payer email (required, valid email)
+  "gym_slug": "sportlife",
+  "amount": 15000.00,
+  "title": "Plan Mensual Premium",
+  "description": "Acceso ilimitado por 30 días",
+  "payer_email": "cliente@email.com",
+  "external_reference": "package_request_123",
+  "mp_access_token": "APP_USR-xxxx-xxxx-xxxx",
+  "success_url": "https://app.fitstackapp.com/payment/success",
+  "failure_url": "https://app.fitstackapp.com/payment/failure",
+  "pending_url": "https://app.fitstackapp.com/payment/pending"
 }
 ```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `gym_slug` | string | Yes | Gym identifier |
+| `amount` | float | Yes | Payment amount (> 0) |
+| `title` | string | Yes | Payment title |
+| `description` | string | No | Payment description |
+| `payer_email` | string | Yes | Customer email |
+| `external_reference` | string | Yes | Your reference ID |
+| `mp_access_token` | string | Yes | Mercado Pago access token (decrypted) |
+| `success_url` | string | No | Redirect on success |
+| `failure_url` | string | No | Redirect on failure |
+| `pending_url` | string | No | Redirect on pending |
 
 **Response (200 OK):**
 ```json
 {
   "success": true,
-  "init_point": "https://www.mercadopago.com.ar/checkout/v1/redirect?pref_id=..."
+  "preference_id": "123456789-abc",
+  "init_point": "https://www.mercadopago.com.ar/checkout/v1/redirect?pref_id=...",
+  "sandbox_init_point": "https://sandbox.mercadopago.com.ar/checkout/v1/redirect?pref_id=..."
 }
 ```
 
-**Error Responses:**
+**Response (400 Bad Request):**
+```json
+{
+  "success": false,
+  "error": "mp_access_token is required",
+  "error_code": "VALIDATION_ERROR"
+}
+```
 
-| Status | Code | Description |
-|--------|------|-------------|
-| `400` | `VALIDATION_ERROR` | Invalid request body |
-| `403` | `PAYMENT_NOT_ENABLED` | Gym doesn't have payment integration |
-| `404` | `GYM_NOT_FOUND` | Gym not found |
-| `500` | `INVALID_TOKEN` | Gym has invalid MP token |
-| `502` | `GATEWAY_ERROR` | Mercado Pago API error |
+**Response (401 Unauthorized):**
+```json
+{
+  "success": false,
+  "error": "Authorization header required",
+  "code": "UNAUTHORIZED"
+}
+```
 
 ---
 
-### Webhook
+### `POST /webhooks/:gym_slug`
 
-Receives payment notifications from Mercado Pago.
+Receives Mercado Pago IPN (Instant Payment Notification).
 
+**Authentication**: None (validates `x-signature` header)
+
+**URL Parameter:**
+- `:gym_slug` - Gym identifier (used to lookup webhook secret)
+
+**Headers from Mercado Pago:**
 ```
-POST /webhook/:gym_slug
+x-signature: ts=1234567890,v1=abc123...
+x-request-id: uuid-v4
 ```
-
-> ⚠️ This endpoint is called by Mercado Pago, not by clients.
-
-**URL Parameters:**
-| Parameter | Description |
-|-----------|-------------|
-| `gym_slug` | Gym identifier included in notification URL |
-
-**Headers (from Mercado Pago):**
-| Header | Description |
-|--------|-------------|
-| `x-signature` | HMAC signature for validation |
-| `x-request-id` | Unique request identifier |
 
 **Request Body (from Mercado Pago):**
 ```json
 {
-  "id": "12345",
+  "id": 12345,
+  "live_mode": true,
   "type": "payment",
+  "date_created": "2025-12-28T10:30:00.000-03:00",
   "action": "payment.created",
   "data": {
-    "id": "67890"
-  },
-  "live_mode": true,
-  "date_created": "2024-01-15T10:30:00Z"
+    "id": "67890123456"
+  }
 }
 ```
 
-**Response:**
+**Response (200 OK):**
 ```json
 {
   "status": "processed"
 }
 ```
 
+**Processing Flow:**
+1. Extract `gym_slug` from URL
+2. Fetch webhook secret from Django: `GET /api/v1/internal/gyms/:slug/credentials/`
+3. Validate `x-signature` using HMAC-SHA256
+4. Fetch payment details from Mercado Pago
+5. Notify Django: `POST /api/v1/payments/webhook-callback/`
+
 ---
 
-### Health Check
+### `GET /health`
 
-Check service health status.
+Health check endpoint.
 
-```
-GET /health
-```
+**Authentication**: None
 
 **Response (200 OK):**
 ```json
 {
   "status": "ok",
-  "service": "fitstack-payments"
+  "service": "fitstack-payments",
+  "version": "1.0.0"
 }
 ```
 
 ---
 
-## Error Response Format
+## Django Endpoints (Required)
 
-All error responses follow this structure:
+This microservice expects the following endpoints in Django:
 
+### `GET /api/v1/internal/gyms/:slug/credentials/`
+
+Returns gym credentials for webhook validation.
+
+**Headers:**
+```
+X-Internal-API-Key: <DJANGO_API_KEY>
+```
+
+**Response:**
 ```json
 {
-  "success": false,
-  "error": "Human-readable error message",
-  "code": "ERROR_CODE"
+  "gym_slug": "sportlife",
+  "webhook_secret": "mp-webhook-secret",
+  "access_token": "APP_USR-xxxx"
 }
 ```
 
-### Error Codes
+### `POST /api/v1/payments/webhook-callback/`
+
+Receives payment confirmations from this microservice.
+
+**Headers:**
+```
+Content-Type: application/json
+X-Webhook-Secret: <DJANGO_API_KEY>
+```
+
+**Request Body:**
+```json
+{
+  "event": "payment.approved",
+  "gym_slug": "sportlife",
+  "external_reference": "package_request_123",
+  "payment_id": "67890123456",
+  "payment_status": "approved",
+  "payment_type": "credit_card",
+  "amount": 15000.00,
+  "payer_email": "cliente@email.com",
+  "timestamp": "2025-12-28T10:30:00Z"
+}
+```
+
+---
+
+## Error Codes
 
 | Code | HTTP Status | Description |
 |------|-------------|-------------|
 | `VALIDATION_ERROR` | 400 | Invalid request data |
-| `UNAUTHORIZED` | 401 | Missing or invalid JWT |
-| `PAYMENT_NOT_ENABLED` | 403 | Gym payment feature disabled |
-| `GYM_NOT_FOUND` | 404 | Gym doesn't exist |
-| `INVALID_TOKEN` | 500 | Invalid MP access token |
-| `GATEWAY_ERROR` | 502 | Mercado Pago API error |
+| `UNAUTHORIZED` | 401 | Missing/invalid Authorization |
+| `GYM_NOT_FOUND` | 404 | Gym not found |
+| `GATEWAY_ERROR` | 500 | Mercado Pago API error |
 | `INTERNAL_ERROR` | 500 | Unexpected server error |
 
 ---
 
-## Integration Examples
+## Environment Variables
 
-### JavaScript/TypeScript
-
-```typescript
-async function createCheckout(gymId: string, amount: number, title: string, email: string) {
-  const response = await fetch('/api/v1/payments/checkout', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${getToken()}`
-    },
-    body: JSON.stringify({
-      gym_id: gymId,
-      amount: amount,
-      title: title,
-      payer_email: email
-    })
-  });
-
-  const data = await response.json();
-  
-  if (data.success) {
-    // Redirect user to Mercado Pago
-    window.location.href = data.init_point;
-  } else {
-    console.error('Payment error:', data.error);
-  }
-}
-```
-
-### Python
-
-```python
-import requests
-
-def create_checkout(gym_id: str, amount: float, title: str, email: str, token: str):
-    response = requests.post(
-        'https://api.fitstackapp.com/payments/api/v1/payments/checkout',
-        headers={
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {token}'
-        },
-        json={
-            'gym_id': gym_id,
-            'amount': amount,
-            'title': title,
-            'payer_email': email
-        }
-    )
-    return response.json()
-```
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `PORT` | No | 8080 | Server port |
+| `GIN_MODE` | No | debug | Gin mode (debug/release) |
+| `DJANGO_BACKEND_URL` | Yes | - | Django API base URL |
+| `DJANGO_API_KEY` | Yes | - | API key for Django communication |
