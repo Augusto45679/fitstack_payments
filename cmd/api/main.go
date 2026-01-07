@@ -1,6 +1,7 @@
 // FitStack Payments Microservice
 //
 // Main entry point - wires up all dependencies and starts the server.
+// Clean Architecture implementation with dependency injection.
 package main
 
 import (
@@ -10,41 +11,90 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/fitstack/fitstack-payments/config"
-	"github.com/fitstack/fitstack-payments/internal/adapters/django"
-	"github.com/fitstack/fitstack-payments/internal/adapters/mercadopago"
-	"github.com/fitstack/fitstack-payments/internal/core/service"
-	"github.com/fitstack/fitstack-payments/internal/handlers"
+	// Infrastructure layer
+	"github.com/fitstack/fitstack-payments/internal/infrastructure/config"
+	"github.com/fitstack/fitstack-payments/internal/infrastructure/external/django"
+	"github.com/fitstack/fitstack-payments/internal/infrastructure/external/mercadopago"
+	"github.com/fitstack/fitstack-payments/internal/infrastructure/persistence/multitenancy"
+
+	// Core layer - Services
+	"github.com/fitstack/fitstack-payments/internal/core/services"
+
+	// Core layer - Use Cases
+	"github.com/fitstack/fitstack-payments/internal/core/usecases/payment"
+
+	// Interface layer
+	"github.com/fitstack/fitstack-payments/internal/interfaces/http"
+	"github.com/fitstack/fitstack-payments/internal/interfaces/http/handlers"
 )
 
 func main() {
-	log.Println("Starting FitStack Payments Service...")
+	log.Println("Starting FitStack Payments Service (Clean Architecture v2.0)...")
 
-	// Load configuration
+	// ===========================
+	// Load Configuration
+	// ===========================
 	cfg := config.Load()
 	log.Printf("Config: Port=%s, Django=%s", cfg.Server.Port, cfg.Django.BaseURL)
 
-	// Wire up dependencies (Clean Architecture)
-	// ============================================
+	// ===========================
+	// Infrastructure Layer Setup
+	// ===========================
 
-	// Adapters (Infrastructure Layer)
+	// External adapters
 	mpAdapter := mercadopago.NewAdapter()
-	mpValidator := mercadopago.NewWebhookValidator()
+	mpWebhookHandler := mercadopago.NewWebhookHandler()
 	djangoClient := django.NewClient(cfg.Django.BaseURL, cfg.Django.APIKey)
 
-	// Service Layer
-	paymentService := service.NewPaymentService(
-		mpAdapter,      // PaymentGateway
-		djangoClient,   // GymCredentialProvider
-		djangoClient,   // DjangoNotifier
-		mpValidator,    // WebhookValidator
+	// Multi-tenancy infrastructure
+	contextHandler := multitenancy.NewContextHandler()
+	_ = contextHandler // Will be used in future middleware
+
+	// ===========================
+	// Core Layer - Services
+	// ===========================
+
+	// Domain services
+	securityService := services.NewSecurityService()
+	notificationService := services.NewNotificationService(djangoClient)
+
+	// ===========================
+	// Core Layer - Use Cases
+	// ===========================
+
+	// Payment use cases
+	createPaymentUC := payment.NewCreatePaymentUseCase(
+		mpAdapter,     // PaymentGateway
+		djangoClient,  // TenantRepository
 	)
 
-	// Handlers (Interface Layer)
-	paymentHandler := handlers.NewPaymentHandler(paymentService)
-	router := handlers.SetupRouter(paymentHandler, cfg.Server.GinMode)
+	processWebhookUC := payment.NewProcessWebhookUseCase(
+		mpAdapter,          // PaymentGateway
+		djangoClient,       // TenantRepository
+		mpWebhookHandler,   // WebhookValidator (or securityService)
+		notificationService, // NotificationService
+	)
 
-	// Start server
+	// ===========================
+	// Interface Layer - HTTP Handlers
+	// ===========================
+
+	paymentHandler := handlers.NewPaymentHandler(createPaymentUC)
+	webhookHandler := handlers.NewWebhookHandler(processWebhookUC)
+	healthHandler := handlers.NewHealthHandler()
+
+	// Setup router
+	router := http.SetupRouter(
+		paymentHandler,
+		webhookHandler,
+		healthHandler,
+		cfg.Server.GinMode,
+	)
+
+	// ===========================
+	// Start Server
+	// ===========================
+
 	serverAddr := fmt.Sprintf(":%s", cfg.Server.Port)
 	go func() {
 		log.Printf("Server listening on %s", serverAddr)
@@ -53,10 +103,13 @@ func main() {
 		}
 	}()
 
-	// Graceful shutdown
+	// ===========================
+	// Graceful Shutdown
+	// ===========================
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("Shutting down...")
+	log.Println("Shutting down gracefully...")
 }
